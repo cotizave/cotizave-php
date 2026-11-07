@@ -38,8 +38,10 @@ or in exception messages.
   prevents the key from being forwarded to another origin.
 - **HTTPS required.** A non-HTTPS `baseUrl` is rejected unless you explicitly set
   `allowInsecureHttp => true` (intended only for local testing).
-- **Response-size cap.** Bodies are capped at `maxResponseBytes` (default 25 MB)
-  to guard against an oversized or decompression-bomb response.
+- **Response-size cap.** Bodies are capped at `maxResponseBytes` (default 25 MB);
+  a larger body is rejected with `response_too_large`. The client never inflates
+  a compressed body (`decode_content` is off), so a decompression bomb is never
+  expanded, and every request is bounded in time by the per-request `timeout`.
 - **Header-injection guard.** Caller-supplied header names and values are
   validated (no CR/LF/control characters) and cannot override `X-API-Key`.
 
