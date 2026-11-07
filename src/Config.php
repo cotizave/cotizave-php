@@ -4,9 +4,6 @@ declare(strict_types=1);
 
 namespace Cotizave;
 
-use GuzzleHttp\Client;
-use GuzzleHttp\ClientInterface;
-
 /**
  * Client configuration: validation and resolved defaults.
  *
@@ -27,7 +24,7 @@ use GuzzleHttp\ClientInterface;
  *     userAgent?: string,
  *     allowInsecureHttp?: bool,
  *     onResponse?: callable,
- *     httpClient?: \GuzzleHttp\ClientInterface
+ *     handler?: callable
  * }
  */
 final class Config
@@ -78,7 +75,8 @@ final class Config
         public readonly ?string $language,
         public readonly string $userAgent,
         public readonly ?\Closure $onResponse,
-        public readonly ClientInterface $httpClient,
+        /** Optional Guzzle handler (callable) used as the base of the HandlerStack. */
+        public readonly ?\Closure $handler,
     ) {
     }
 
@@ -156,7 +154,7 @@ final class Config
             language: isset($options['language']) ? self::validateHeaderValue($options['language'], 'language') : null,
             userAgent: $userAgent,
             onResponse: isset($options['onResponse']) ? \Closure::fromCallable($options['onResponse']) : null,
-            httpClient: $options['httpClient'] ?? new Client(),
+            handler: isset($options['handler']) ? \Closure::fromCallable($options['handler']) : null,
         );
     }
 

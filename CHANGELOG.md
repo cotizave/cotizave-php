@@ -15,5 +15,6 @@ to [Semantic Versioning](https://semver.org/).
 - Typed exception hierarchy (`CotizaveException` and subclasses), controlled
   retries with full jitter and a time budget, a response-size cap, origin
   pinning and redirect refusal to protect the API key.
-- Built on Guzzle; a PSR-18 client can be injected. PHPStan array-shape types
-  for responses.
+- Built on Guzzle: retries run on the Guzzle `HandlerStack` via
+  `Middleware::retry`, and a custom Guzzle handler can be supplied. PHPStan
+  array-shape types for responses.

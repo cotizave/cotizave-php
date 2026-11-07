@@ -24,8 +24,8 @@ calendars, behind a single API key.
 composer require cotizave/sdk
 ```
 
-Requires PHP 8.3+. The HTTP engine is [Guzzle](https://docs.guzzlephp.org/); any
-PSR-18 client can be injected instead.
+Requires PHP 8.3+. The HTTP engine is [Guzzle](https://docs.guzzlephp.org/); a
+custom Guzzle handler can be supplied (e.g. for testing or instrumentation).
 
 ## Quick start
 
@@ -193,17 +193,23 @@ echo $result->notModified, ' ', $result->meta->status;
 var_dump($result->data);
 ```
 
-## Injecting your own HTTP client
+## Customising the HTTP handler
+
+The transport builds its own Guzzle client (with the SDK's retry middleware on
+the handler stack). To customise the underlying transport — for tests,
+instrumentation, or a bespoke handler — pass a Guzzle `handler` callable:
 
 ```php
 use Cotizave\Cotizave;
-use GuzzleHttp\Client;
+use GuzzleHttp\Handler\MockHandler;
+use GuzzleHttp\Psr7\Response;
 
-$client = new Cotizave(['httpClient' => new Client(['proxy' => '...'])]);
+$mock = new MockHandler([new Response(200, [], '{"id":"co-trm"}')]);
+$client = new Cotizave(['handler' => $mock]);
 ```
 
-The SDK always sends with redirects disabled, so an injected client can never be
-made to forward your API key to a redirect target.
+The SDK always sends with redirects disabled and the key as a header, so a
+custom handler can never be made to follow a redirect or leak your API key.
 
 ## Security
 

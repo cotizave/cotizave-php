@@ -7,27 +7,21 @@ namespace Cotizave\Tests;
 use Cotizave\Cotizave;
 use Cotizave\Exception\ConnectionException;
 use Cotizave\Exception\CotizaveException;
-use GuzzleHttp\Client;
 use GuzzleHttp\Exception\ConnectException;
-use GuzzleHttp\Handler\MockHandler;
-use GuzzleHttp\HandlerStack;
 use GuzzleHttp\Psr7\Request;
 use GuzzleHttp\Psr7\Response;
 
 final class SecurityTest extends TestCase
 {
-    public function testRedirectNotFollowedEvenWithPermissiveClient(): void
+    public function testRedirectRefusedAndKeyNotForwarded(): void
     {
-        // A client whose default is to FOLLOW redirects must still not be allowed
-        // to forward the X-API-Key header to a redirect target: the transport
-        // forces allow_redirects=false on every request.
-        $mock = new MockHandler([
+        // The Guzzle stack's redirect middleware is present, but the transport
+        // forces allow_redirects=false on every request, so a 3xx is refused and
+        // the X-API-Key header is never forwarded to the redirect target.
+        $client = $this->client([
             new Response(302, ['Location' => 'https://evil.com/steal']),
             new Response(200, [], (string) json_encode(['ok' => true])), // must NEVER be reached
         ]);
-        $stack = HandlerStack::create($mock);
-        $permissive = new Client(['handler' => $stack, 'allow_redirects' => true]);
-        $client = new Cotizave(['apiKey' => 'ctz_secret', 'httpClient' => $permissive]);
 
         try {
             $client->rates->get('CO', 'x', ['maxRetries' => 0]);
@@ -36,8 +30,8 @@ final class SecurityTest extends TestCase
             self::assertSame('unexpected_redirect', $e->errorCode);
         }
 
-        // The second (evil) response was never consumed — the key never left.
-        self::assertSame(1, $mock->count());
+        // The evil response was never consumed — the key never left.
+        self::assertSame(1, $this->requestCount());
     }
 
     public function testApiKeyNotInExceptionMessage(): void

@@ -25,7 +25,7 @@ composer require cotizave/sdk
 ```
 
 Requiere PHP 8.3+. El motor HTTP es [Guzzle](https://docs.guzzlephp.org/); se puede
-inyectar cualquier cliente PSR-18 en su lugar.
+pasar un handler de Guzzle propio (por ejemplo para tests o instrumentación).
 
 ## Inicio rápido
 
@@ -193,17 +193,24 @@ echo $result->notModified, ' ', $result->meta->status;
 var_dump($result->data);
 ```
 
-## Inyectar tu propio cliente HTTP
+## Personalizar el handler HTTP
+
+El transporte construye su propio cliente de Guzzle (con el middleware de
+reintentos del SDK en el handler stack). Para personalizar el transporte —
+tests, instrumentación o un handler a medida — pasá un `handler` de Guzzle:
 
 ```php
 use Cotizave\Cotizave;
-use GuzzleHttp\Client;
+use GuzzleHttp\Handler\MockHandler;
+use GuzzleHttp\Psr7\Response;
 
-$client = new Cotizave(['httpClient' => new Client(['proxy' => '...'])]);
+$mock = new MockHandler([new Response(200, [], '{"id":"co-trm"}')]);
+$client = new Cotizave(['handler' => $mock]);
 ```
 
-El SDK siempre envía con los redirects deshabilitados, así que un cliente
-inyectado nunca puede ser inducido a reenviar tu API key a un destino de redirect.
+El SDK siempre envía con los redirects deshabilitados y la key como cabecera, así
+que un handler propio nunca puede ser inducido a seguir un redirect ni a filtrar
+tu API key.
 
 ## Seguridad
 

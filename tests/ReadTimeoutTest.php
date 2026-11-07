@@ -4,10 +4,9 @@ declare(strict_types=1);
 
 namespace Cotizave\Tests;
 
+use Cotizave\Cotizave;
 use Cotizave\Exception\ConnectionException;
 use Cotizave\Exception\CotizaveException;
-use Cotizave\Exception\TimeoutException;
-use Cotizave\Tests\Fixtures\SlowStream;
 use Cotizave\Tests\Fixtures\ThrowingStream;
 use GuzzleHttp\Psr7\Response;
 use GuzzleHttp\Psr7\Utils;
@@ -29,18 +28,49 @@ final class ReadTimeoutTest extends TestCase
         }
     }
 
-    public function testStallingBodyIsCutOffByTheReadDeadline(): void
+    public function testSlowBodyIsBoundedByTheRequestTimeout(): void
     {
-        // A body that never ends must be bounded by the per-request timeout and
-        // raise TimeoutException — not hang the caller.
-        $client = $this->client([new Response(200, [], new SlowStream(Utils::streamFor('')))], ['timeout' => 0.1]);
-        $start = microtime(true);
-        try {
-            $client->rates->get('CO', 'x', ['maxRetries' => 0]);
-            self::fail('expected a timeout');
-        } catch (TimeoutException $e) {
-            self::assertSame('timeout', $e->errorCode);
+        // Loopback regression for NV1: a server that trickles the body forever
+        // must be cut off by Guzzle's request `timeout` (the library bound) and
+        // mapped to a typed SDK error — not hang the caller.
+        if (!\extension_loaded('curl') || !\function_exists('proc_open')) {
+            self::markTestSkipped('needs ext-curl and proc_open');
         }
-        self::assertLessThan(2.0, microtime(true) - $start, 'the read was not bounded by the timeout');
+        $port = 9700 + random_int(1, 250);
+        $script = __DIR__ . '/Fixtures/slow_body_server.php';
+        $proc = proc_open([PHP_BINARY, $script, (string) $port], [1 => ['pipe', 'w'], 2 => ['pipe', 'w']], $pipes);
+        if (!is_resource($proc)) {
+            self::markTestSkipped('could not start the loopback server');
+        }
+
+        try {
+            $ready = fgets($pipes[1]);
+            self::assertIsString($ready);
+            self::assertStringContainsString('READY', $ready);
+
+            $client = new Cotizave([
+                'apiKey' => 'x',
+                'baseUrl' => "http://127.0.0.1:{$port}",
+                'allowInsecureHttp' => true,
+            ]);
+
+            $start = microtime(true);
+            try {
+                $client->rates->get('CO', 'x', ['timeout' => 1.0, 'maxRetries' => 0]);
+                self::fail('expected the slow body to be cut off');
+            } catch (CotizaveException $e) {
+                self::assertContains($e->errorCode, ['timeout', 'connection_error']);
+            }
+            $elapsed = microtime(true) - $start;
+            self::assertLessThan(5.0, $elapsed, 'the streamed read was not bounded by the timeout');
+        } finally {
+            proc_terminate($proc);
+            foreach ($pipes as $pipe) {
+                if (is_resource($pipe)) {
+                    fclose($pipe);
+                }
+            }
+            proc_close($proc);
+        }
     }
 }

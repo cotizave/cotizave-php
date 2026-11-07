@@ -5,22 +5,20 @@ declare(strict_types=1);
 namespace Cotizave\Tests;
 
 use Cotizave\Cotizave;
-use GuzzleHttp\Client;
 use GuzzleHttp\Handler\MockHandler;
-use GuzzleHttp\HandlerStack;
-use GuzzleHttp\Middleware;
 use PHPUnit\Framework\TestCase as BaseTestCase;
 use Psr\Http\Message\RequestInterface;
 
 abstract class TestCase extends BaseTestCase
 {
-    /** @var list<array{request: RequestInterface, response?: mixed, error?: mixed, options: array<string, mixed>}> */
-    protected array $history = [];
-
     protected MockHandler $mock;
 
+    private int $queued = 0;
+
     /**
-     * Build a client whose HTTP layer is a Guzzle MockHandler.
+     * Build a client whose Guzzle base handler is a MockHandler, so the SDK's own
+     * retry middleware (on the HandlerStack Transport builds) drives retries over
+     * the queued responses — exactly as it would in production.
      *
      * @param list<\Psr\Http\Message\ResponseInterface|\Throwable> $responses
      * @param array<string, mixed>                                 $options
@@ -28,27 +26,25 @@ abstract class TestCase extends BaseTestCase
     protected function client(array $responses, array $options = []): Cotizave
     {
         $this->mock = new MockHandler($responses);
-        $stack = HandlerStack::create($this->mock);
-        $this->history = [];
-        $stack->push(Middleware::history($this->history));
-        $guzzle = new Client(['handler' => $stack]);
+        $this->queued = count($responses);
 
-        /** @var array{apiKey?: string, httpClient?: \GuzzleHttp\ClientInterface} $merged */
-        $merged = array_merge(['apiKey' => 'ctz_test_key', 'httpClient' => $guzzle], $options);
+        /** @var array{apiKey?: string, handler?: callable} $merged */
+        $merged = array_merge(['apiKey' => 'ctz_test_key', 'handler' => $this->mock], $options);
 
         return new Cotizave($merged);
     }
 
     protected function lastRequest(): RequestInterface
     {
-        $entry = end($this->history);
-        self::assertIsArray($entry, 'No request was recorded.');
+        $request = $this->mock->getLastRequest();
+        self::assertNotNull($request, 'No request was recorded.');
 
-        return $entry['request'];
+        return $request;
     }
 
+    /** Number of HTTP requests actually sent (initial attempt + retries). */
     protected function requestCount(): int
     {
-        return count($this->history);
+        return $this->queued - $this->mock->count();
     }
 }

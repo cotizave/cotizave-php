@@ -7,20 +7,28 @@ namespace Cotizave;
 use Cotizave\Exception\ConnectionException;
 use Cotizave\Exception\CotizaveException;
 use Cotizave\Exception\TimeoutException;
+use GuzzleHttp\Client;
+use GuzzleHttp\ClientInterface;
 use GuzzleHttp\Exception\ConnectException;
 use GuzzleHttp\Exception\TransferException;
+use GuzzleHttp\HandlerStack;
+use GuzzleHttp\Middleware;
 use GuzzleHttp\Psr7\Request;
 use GuzzleHttp\Psr7\Uri;
+use GuzzleHttp\Psr7\Utils;
 use GuzzleHttp\RequestOptions;
+use Psr\Http\Message\RequestInterface;
 use Psr\Http\Message\ResponseInterface;
 
 /**
  * The typed HTTP layer, built on Guzzle.
  *
- * Adds what is specific to Cotizave on top of the HTTP client: authentication,
- * pinning every request to the configured origin, refusing redirects, the retry
- * policy (quota vs. burst limits), a response-size cap, and mapping failures to
- * typed CotizaveException. Resource classes sit on top of it.
+ * The HTTP mechanics are the library's: retries run on Guzzle's HandlerStack via
+ * Middleware::retry, timeouts/redirects are Guzzle request options. This class
+ * supplies only the Cotizave-specific policy and SDK logic: the retry decision
+ * (quota vs burst 429, Retry-After, jitter, budget), authentication, origin
+ * pinning, error -> exception mapping, rate-limit header parsing, and the
+ * max-response-bytes cap (which Guzzle has no feature for).
  *
  * @internal
  *
@@ -29,10 +37,34 @@ use Psr\Http\Message\ResponseInterface;
 final class Transport
 {
     private readonly string $origin;
+    private readonly ClientInterface $client;
+
+    // Per-request retry state, read by the Guzzle retry middleware's decider/delay
+    // callbacks. Safe as instance fields: the SDK issues one blocking request at a
+    // time (no concurrency), and the middleware runs synchronously inside send().
+    private int $retryLimit = 0;
+    private string $retryMethod = 'GET';
+    private string $retryPath = '';
+    private float $retryBudgetLeft = 0.0;
+    private int $nextDelayMs = 0;
+    private ?CotizaveException $lastRetryError = null;
 
     public function __construct(private readonly Config $config)
     {
         $this->origin = self::originOf($config->baseUrl);
+
+        // The retry loop is Guzzle's (Middleware::retry on the HandlerStack); we
+        // supply only the decide/delay policy. HandlerStack::create() gives the
+        // default cURL handler (or the caller-supplied handler) plus Guzzle's own
+        // middlewares (redirect, http_errors, ...).
+        $stack = HandlerStack::create($config->handler);
+        $stack->push(Middleware::retry(
+            fn (int $retries, RequestInterface $request, ?ResponseInterface $response = null, ?\Throwable $reason = null): bool
+                => $this->decideRetry($retries, $request, $response, $reason),
+            fn (int $retries, ?ResponseInterface $response = null, ?RequestInterface $request = null): int
+                => $this->retryDelayMs($retries),
+        ));
+        $this->client = new Client(['handler' => $stack]);
     }
 
     public function historyTimeout(): float
@@ -41,10 +73,8 @@ final class Transport
     }
 
     /**
-     * JSON convenience GET: returns the parsed body.
-     *
      * @param array<string, scalar|null> $query
-     * @param RequestConfig               $config
+     * @param RequestConfig              $config
      */
     public function get(string $path, array $query = [], array $config = []): mixed
     {
@@ -52,8 +82,6 @@ final class Transport
     }
 
     /**
-     * JSON convenience POST.
-     *
      * @param array<string, mixed> $body
      * @param RequestConfig        $config
      */
@@ -63,9 +91,6 @@ final class Transport
     }
 
     /**
-     * Full request with metadata. Failed attempts are retried per the policy,
-     * bounded by maxRetries and the maxRetryDelay budget.
-     *
      * @param array<string, scalar|null> $query
      * @param array<string, mixed>|null  $body
      * @param RequestConfig              $config
@@ -77,40 +102,23 @@ final class Transport
         $headers = $this->buildHeaders($method, $config, $extra, $body !== null);
         $timeout = isset($config['timeout']) ? (float) $config['timeout'] : $this->config->timeout;
         $maxBytes = $extra['maxResponseBytes'] ?? $this->config->maxResponseBytes;
-        $limit = $config['maxRetries'] ?? $this->config->maxRetries;
         $parse = $extra['parse'] ?? 'json';
 
-        $budget = $this->config->maxRetryDelay;
-        $spent = 0.0;
-        $attempt = 0;
+        // Hand the retry middleware the policy inputs for this call.
+        $this->retryLimit = $config['maxRetries'] ?? $this->config->maxRetries;
+        $this->retryMethod = $method;
+        $this->retryPath = $path;
+        $this->retryBudgetLeft = $this->config->maxRetryDelay;
+        $this->lastRetryError = null;
 
-        while (true) {
-            try {
-                return $this->exchange($method, $path, $url, $headers, $body, $timeout, $maxBytes, $parse);
-            } catch (CotizaveException $error) {
-                if ($attempt >= $limit || !Retry::shouldRetry($error, $attempt, $method, $path, $this->config)) {
-                    throw $error;
-                }
-                $delay = Retry::nextDelaySeconds($error, $attempt, $budget - $spent, $this->config);
-                if ($delay === null) {
-                    throw $error;
-                }
-                $spent += $delay;
-                if ($this->config->onRetry !== null) {
-                    self::safeCall($this->config->onRetry, new RetryEvent($error, $attempt + 1, $delay, $method, $path));
-                }
-                if ($delay > 0) {
-                    usleep((int) round($delay * 1_000_000));
-                }
-                $attempt++;
-            }
-        }
+        return $this->exchange($method, $path, $url, $headers, $body, $timeout, $maxBytes, $parse);
     }
 
     /**
-     * A single HTTP exchange, with errors already mapped to CotizaveException.
+     * One logical exchange. Guzzle performs any retries internally (via the retry
+     * middleware); this maps the final response/exception to the SDK's types.
      *
-     * @param array<string, string>    $headers
+     * @param array<string, string>     $headers
      * @param array<string, mixed>|null $body
      * @param 'json'|'text'            $parse
      */
@@ -120,30 +128,27 @@ final class Transport
         $request = new Request($method, $url, $headers, $content);
 
         try {
-            $response = $this->config->httpClient->send($request, [
+            $response = $this->client->send($request, [
                 RequestOptions::ALLOW_REDIRECTS => false,
                 RequestOptions::HTTP_ERRORS => false,
                 RequestOptions::STREAM => true,
-                RequestOptions::TIMEOUT => $timeout,
+                RequestOptions::TIMEOUT => $timeout,        // bounds the whole transfer, incl. the body read (cURL)
                 RequestOptions::CONNECT_TIMEOUT => $timeout,
+                RequestOptions::READ_TIMEOUT => $timeout,   // bounds the body read for the StreamHandler
             ]);
         } catch (ConnectException $e) {
-            $msg = $e->getMessage();
-            if (stripos($msg, 'timed out') !== false || stripos($msg, 'timeout') !== false) {
-                throw new TimeoutException("Request to {$url} timed out after {$timeout}s.", errorCode: 'timeout', previous: $e);
-            }
-            throw new ConnectionException("Network error while requesting {$url}: {$msg}", errorCode: 'connection_error', previous: $e);
+            throw $this->fromTransferError($e, $url);
         } catch (TransferException $e) {
             throw new ConnectionException("Network error while requesting {$url}: {$e->getMessage()}", errorCode: 'connection_error', previous: $e);
         }
 
         $status = $response->getStatusCode();
+        $meta = Headers::buildMeta($status, $response->getHeaders());
 
         if ($status >= 300 && $status < 400 && $response->hasHeader('Location')) {
             // The API is not expected to redirect; following one could forward the
-            // X-API-Key header to another origin. Refuse it (and never follow it:
-            // ALLOW_REDIRECTS is false even for an injected client).
-            $meta = Headers::buildMeta($status, $response->getHeaders());
+            // X-API-Key header to another origin. allow_redirects=false already
+            // prevents following it; turn the response itself into an error.
             throw new CotizaveException(
                 'Refusing to follow a redirect to ' . var_export($response->getHeaderLine('Location'), true)
                     . '; the API is not expected to redirect and following one could leak the API key.',
@@ -153,30 +158,34 @@ final class Transport
             );
         }
 
-        $readStart = microtime(true);
-        try {
-            $text = $this->readCapped($response, $maxBytes, $url, $timeout);
-        } catch (CotizaveException $e) {
-            throw $e; // response_too_large, or our own read-deadline TimeoutException
-        } catch (\Throwable $e) {
-            // A failure while reading the streamed body (e.g. the HTTP client's
-            // own read timeout firing mid-body) surfaces as a generic stream
-            // exception. Map it into the SDK hierarchy so it is typed and
-            // retryable, exactly like a send-phase failure.
-            if ((microtime(true) - $readStart) >= $timeout * 0.95) {
-                throw new TimeoutException(
-                    "Request to {$url} timed out after {$timeout}s while reading the response body.",
-                    errorCode: 'timeout',
-                    previous: $e,
-                );
-            }
-            throw new ConnectionException(
-                "Network error while reading the response body from {$url}: {$e->getMessage()}",
-                errorCode: 'connection_error',
-                previous: $e,
+        // Max-response-bytes cap (Guzzle has no option for this). Reject early on a
+        // declared Content-Length, then read defensively with the same bound in
+        // case the length is absent or understated.
+        $declared = $response->getHeaderLine('Content-Length');
+        if ($declared !== '' && ctype_digit($declared) && (int) $declared > $maxBytes) {
+            throw new CotizaveException(
+                "Response body exceeded the maximum allowed size ({$maxBytes} bytes).",
+                status: $status,
+                errorCode: 'response_too_large',
+                meta: $meta,
             );
         }
-        $meta = Headers::buildMeta($status, $response->getHeaders());
+
+        $readStart = microtime(true);
+        try {
+            $text = $this->readCapped($response, $maxBytes);
+        } catch (CotizaveException $e) {
+            throw $e; // response_too_large
+        } catch (\Throwable $e) {
+            // A failure while reading the streamed body (e.g. the Guzzle/cURL read
+            // timeout firing mid-body) surfaces as a generic stream exception. Map
+            // it into the SDK hierarchy so it is typed and retryable, like a
+            // send-phase failure.
+            if ((microtime(true) - $readStart) >= $timeout * 0.95) {
+                throw new TimeoutException("Request to {$url} timed out after {$timeout}s while reading the response body.", errorCode: 'timeout', meta: $meta, previous: $e);
+            }
+            throw new ConnectionException("Network error while reading the response body from {$url}: {$e->getMessage()}", errorCode: 'connection_error', meta: $meta, previous: $e);
+        }
 
         if ($this->config->onResponse !== null) {
             self::safeCall($this->config->onResponse, new ResponseEvent($method, $path, $meta));
@@ -212,41 +221,101 @@ final class Transport
         return new RawResult($decoded, $meta, false);
     }
 
-    private function readCapped(ResponseInterface $response, int $maxBytes, string $url, float $timeout): string
+    /**
+     * Read the body with the byte cap, using the library helper (no hand-rolled
+     * loop). Reads at most maxBytes+1 bytes; more than maxBytes means the body is
+     * over the cap. Time is bounded by Guzzle's request `timeout`, which aborts
+     * the streamed read (validated: a stalled body fails in ~the timeout), so no
+     * custom read-deadline is needed.
+     */
+    private function readCapped(ResponseInterface $response, int $maxBytes): string
     {
-        $stream = $response->getBody();
-        $buffer = '';
-        $total = 0;
-        // Bound the streaming read by an elapsed-time deadline, so a slow/stalling
-        // body cannot hang the caller even if the underlying client does not
-        // enforce a read timeout. (cURL does enforce one; this also covers other
-        // PSR-18/handler implementations that may not.)
-        $deadline = microtime(true) + $timeout;
-        while (!$stream->eof()) {
-            if (microtime(true) >= $deadline) {
-                $stream->close();
-                throw new TimeoutException(
-                    "Request to {$url} timed out after {$timeout}s while reading the response body.",
-                    errorCode: 'timeout',
-                );
-            }
-            $chunk = $stream->read(16384);
-            if ($chunk === '') {
-                break;
-            }
-            $total += strlen($chunk);
-            if ($total > $maxBytes) {
-                $stream->close();
-                throw new CotizaveException(
-                    "Response body exceeded the maximum allowed size ({$maxBytes} bytes).",
-                    errorCode: 'response_too_large',
-                );
-            }
-            $buffer .= $chunk;
+        $text = Utils::copyToString($response->getBody(), $maxBytes + 1);
+        if (strlen($text) > $maxBytes) {
+            throw new CotizaveException(
+                "Response body exceeded the maximum allowed size ({$maxBytes} bytes).",
+                errorCode: 'response_too_large',
+            );
         }
 
-        return $buffer;
+        return $text;
     }
+
+    // -- retry policy plugged into Guzzle's retry middleware -----------------
+
+    private function decideRetry(int $retries, RequestInterface $request, ?ResponseInterface $response, ?\Throwable $reason): bool
+    {
+        if ($retries >= $this->retryLimit) {
+            return false;
+        }
+        $error = $this->mapForRetry($response, $reason);
+        if ($error === null) {
+            return false; // a success response, or an error we do not understand
+        }
+        if (!Retry::shouldRetry($error, $retries, $request->getMethod(), $this->retryPath, $this->config)) {
+            return false;
+        }
+        $delay = Retry::nextDelaySeconds($error, $retries, $this->retryBudgetLeft, $this->config);
+        if ($delay === null) {
+            return false; // out of the retry-delay budget
+        }
+        $this->retryBudgetLeft -= $delay;
+        $this->nextDelayMs = (int) round($delay * 1000);
+        $this->lastRetryError = $error;
+
+        return true;
+    }
+
+    private function retryDelayMs(int $retries): int
+    {
+        if ($this->config->onRetry !== null && $this->lastRetryError !== null) {
+            self::safeCall(
+                $this->config->onRetry,
+                new RetryEvent($this->lastRetryError, $retries, $this->nextDelayMs / 1000, $this->retryMethod, $this->retryPath),
+            );
+        }
+
+        return $this->nextDelayMs;
+    }
+
+    /**
+     * Build the exception used for the retry DECISION from status + headers only
+     * (never the body, which must stay unread for the final mapping).
+     */
+    private function mapForRetry(?ResponseInterface $response, ?\Throwable $reason): ?CotizaveException
+    {
+        if ($reason !== null) {
+            if ($reason instanceof ConnectException) {
+                return $this->fromTransferError($reason, (string) $reason->getRequest()->getUri());
+            }
+            if ($reason instanceof TransferException) {
+                return new ConnectionException($reason->getMessage(), errorCode: 'connection_error', previous: $reason);
+            }
+
+            return null;
+        }
+        if ($response === null) {
+            return null;
+        }
+        $status = $response->getStatusCode();
+        if ($status < 400) {
+            return null;
+        }
+
+        return CotizaveException::fromResponse($status, null, Headers::buildMeta($status, $response->getHeaders()));
+    }
+
+    private function fromTransferError(ConnectException $e, string $url): CotizaveException
+    {
+        $msg = $e->getMessage();
+        if (stripos($msg, 'timed out') !== false || stripos($msg, 'timeout') !== false) {
+            return new TimeoutException("Request to {$url} timed out.", errorCode: 'timeout', previous: $e);
+        }
+
+        return new ConnectionException("Network error while requesting {$url}: {$msg}", errorCode: 'connection_error', previous: $e);
+    }
+
+    // -- request building ----------------------------------------------------
 
     /**
      * @param array<string, scalar|null> $query
@@ -321,11 +390,9 @@ final class Transport
 
     /**
      * The scheme/host/port origin of a URL, parsed with the SAME parser Guzzle
-     * uses to build the request (GuzzleHttp\Psr7\Uri). Using one parser for both
-     * the origin check and the actual request removes any parser-differential
-     * that could let a crafted path slip the API key to another host. A malformed
-     * URL returns a sentinel that never matches a real origin, so the caller gets
-     * a typed invalid_request_path error instead of an uncaught MalformedUriException.
+     * uses to build the request (GuzzleHttp\Psr7\Uri). One parser for both the
+     * origin check and the request removes any parser-differential, and a
+     * malformed URL returns a sentinel that never matches a real origin.
      */
     private static function originOf(string $url): string
     {
