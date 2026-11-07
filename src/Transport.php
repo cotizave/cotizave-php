@@ -131,10 +131,15 @@ final class Transport
             $response = $this->client->send($request, [
                 RequestOptions::ALLOW_REDIRECTS => false,
                 RequestOptions::HTTP_ERRORS => false,
-                RequestOptions::STREAM => true,
-                RequestOptions::TIMEOUT => $timeout,        // bounds the whole transfer, incl. the body read (cURL)
+                // Deliberately NOT streaming: a streamed (lazy) body read is not
+                // bounded by the request timeout on all platforms (validated — it
+                // hung on Linux). A non-streamed request downloads the body inside
+                // cURL's TIMEOUT, so the whole exchange is reliably time-bounded.
+                // decode_content=false means we never inflate a compressed body,
+                // which removes the decompression-bomb reason for streaming.
+                RequestOptions::DECODE_CONTENT => false,
+                RequestOptions::TIMEOUT => $timeout,
                 RequestOptions::CONNECT_TIMEOUT => $timeout,
-                RequestOptions::READ_TIMEOUT => $timeout,   // bounds the body read for the StreamHandler
             ]);
         } catch (ConnectException $e) {
             throw $this->fromTransferError($e, $url);
@@ -171,19 +176,15 @@ final class Transport
             );
         }
 
-        $readStart = microtime(true);
         try {
             $text = $this->readCapped($response, $maxBytes);
         } catch (CotizaveException $e) {
             throw $e; // response_too_large
         } catch (\Throwable $e) {
-            // A failure while reading the streamed body (e.g. the Guzzle/cURL read
-            // timeout firing mid-body) surfaces as a generic stream exception. Map
-            // it into the SDK hierarchy so it is typed and retryable, like a
-            // send-phase failure.
-            if ((microtime(true) - $readStart) >= $timeout * 0.95) {
-                throw new TimeoutException("Request to {$url} timed out after {$timeout}s while reading the response body.", errorCode: 'timeout', meta: $meta, previous: $e);
-            }
+            // A failure while materialising the body surfaces as a generic stream
+            // exception. Map it into the SDK hierarchy so it is typed (and, for a
+            // GET, retryable) rather than leaking a raw \RuntimeException. The
+            // request time itself is already bounded by the send-phase timeout.
             throw new ConnectionException("Network error while reading the response body from {$url}: {$e->getMessage()}", errorCode: 'connection_error', meta: $meta, previous: $e);
         }
 
@@ -222,11 +223,10 @@ final class Transport
     }
 
     /**
-     * Read the body with the byte cap, using the library helper (no hand-rolled
-     * loop). Reads at most maxBytes+1 bytes; more than maxBytes means the body is
-     * over the cap. Time is bounded by Guzzle's request `timeout`, which aborts
-     * the streamed read (validated: a stalled body fails in ~the timeout), so no
-     * custom read-deadline is needed.
+     * Materialise the body with the byte cap, using the library helper (no
+     * hand-rolled loop). The body has already been downloaded within the request
+     * timeout (non-streaming); copyToString caps what we read into a string at
+     * maxBytes+1, and more than maxBytes means the body is over the cap.
      */
     private function readCapped(ResponseInterface $response, int $maxBytes): string
     {
