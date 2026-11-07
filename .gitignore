@@ -1,0 +1,15 @@
+# Dependencies (a library does not commit its lock file or vendor dir)
+/vendor/
+composer.lock
+
+# Tool caches
+/.phpunit.cache/
+/.php-cs-fixer.cache
+/build/
+/coverage/
+.phpunit.result.cache
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/

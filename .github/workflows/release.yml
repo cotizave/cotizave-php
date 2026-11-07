@@ -1,0 +1,54 @@
+name: Release
+
+# Tag-triggered release. To publish version X.Y.Z:
+#   1. update CHANGELOG.md and commit,
+#   2. git tag vX.Y.Z && git push origin vX.Y.Z
+#
+# Pushing the tag runs the full gate and creates a GitHub Release. Packagist
+# publishes the new version automatically from the git tag once the package is
+# registered on Packagist and the GitHub repository is linked (webhook) — there
+# is no token or upload step here. Composer derives the version from the tag, so
+# composer.json intentionally has no "version" field.
+on:
+  push:
+    tags: ['v[0-9]+.[0-9]+.[0-9]+']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.3'
+          tools: composer:v2
+          coverage: none
+      - run: composer install --no-interaction --no-progress
+      - name: Gate (lint, static analysis, tests, audit)
+        run: |
+          PHP_CS_FIXER_IGNORE_ENV=1 vendor/bin/php-cs-fixer fix --dry-run --diff
+          vendor/bin/phpstan analyse --no-progress
+          vendor/bin/phpunit
+          composer audit
+
+  release:
+    needs: gate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # create the GitHub Release
+    steps:
+      - uses: actions/checkout@v4
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if ! gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+            gh release create "${GITHUB_REF_NAME}" --title "${GITHUB_REF_NAME}" --generate-notes
+          fi
