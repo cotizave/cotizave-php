@@ -153,7 +153,29 @@ final class Transport
             );
         }
 
-        $text = $this->readCapped($response, $maxBytes, $url);
+        $readStart = microtime(true);
+        try {
+            $text = $this->readCapped($response, $maxBytes, $url, $timeout);
+        } catch (CotizaveException $e) {
+            throw $e; // response_too_large, or our own read-deadline TimeoutException
+        } catch (\Throwable $e) {
+            // A failure while reading the streamed body (e.g. the HTTP client's
+            // own read timeout firing mid-body) surfaces as a generic stream
+            // exception. Map it into the SDK hierarchy so it is typed and
+            // retryable, exactly like a send-phase failure.
+            if ((microtime(true) - $readStart) >= $timeout * 0.95) {
+                throw new TimeoutException(
+                    "Request to {$url} timed out after {$timeout}s while reading the response body.",
+                    errorCode: 'timeout',
+                    previous: $e,
+                );
+            }
+            throw new ConnectionException(
+                "Network error while reading the response body from {$url}: {$e->getMessage()}",
+                errorCode: 'connection_error',
+                previous: $e,
+            );
+        }
         $meta = Headers::buildMeta($status, $response->getHeaders());
 
         if ($this->config->onResponse !== null) {
@@ -190,12 +212,24 @@ final class Transport
         return new RawResult($decoded, $meta, false);
     }
 
-    private function readCapped(ResponseInterface $response, int $maxBytes, string $url): string
+    private function readCapped(ResponseInterface $response, int $maxBytes, string $url, float $timeout): string
     {
         $stream = $response->getBody();
         $buffer = '';
         $total = 0;
+        // Bound the streaming read by an elapsed-time deadline, so a slow/stalling
+        // body cannot hang the caller even if the underlying client does not
+        // enforce a read timeout. (cURL does enforce one; this also covers other
+        // PSR-18/handler implementations that may not.)
+        $deadline = microtime(true) + $timeout;
         while (!$stream->eof()) {
+            if (microtime(true) >= $deadline) {
+                $stream->close();
+                throw new TimeoutException(
+                    "Request to {$url} timed out after {$timeout}s while reading the response body.",
+                    errorCode: 'timeout',
+                );
+            }
             $chunk = $stream->read(16384);
             if ($chunk === '') {
                 break;
