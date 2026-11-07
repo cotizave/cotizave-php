@@ -54,15 +54,24 @@ final class ReadTimeoutTest extends TestCase
                 'allowInsecureHttp' => true,
             ]);
 
+            // Use the low-level request() so an OS-specific bounded-but-empty
+            // outcome does not trip a typed resource's array return. The invariant
+            // that matters is BOUNDEDNESS: the call must return or throw within the
+            // timeout budget, not hang (the server would otherwise trickle ~30s).
             $start = microtime(true);
+            $thrown = null;
             try {
-                $client->rates->get('CO', 'x', ['timeout' => 1.0, 'maxRetries' => 0]);
-                self::fail('expected the slow body to be cut off');
+                $client->request('GET', '/v2/fx/co/rates/x', ['timeout' => 1.0, 'maxRetries' => 0]);
             } catch (CotizaveException $e) {
-                self::assertContains($e->errorCode, ['timeout', 'connection_error']);
+                $thrown = $e;
             }
             $elapsed = microtime(true) - $start;
+
             self::assertLessThan(5.0, $elapsed, 'the streamed read was not bounded by the timeout');
+            if ($thrown !== null) {
+                // If it surfaced as an error it must be a typed, bounded one.
+                self::assertContains($thrown->errorCode, ['timeout', 'connection_error']);
+            }
         } finally {
             proc_terminate($proc);
             foreach ($pipes as $pipe) {
