@@ -59,4 +59,43 @@ final class SecurityTest extends TestCase
         self::assertStringNotContainsString('ctz_test_key', (string) $req->getUri());
         self::assertSame('ctz_test_key', $req->getHeaderLine('X-API-Key'));
     }
+
+    public function testApiKeyNotExposedByObjectDumps(): void
+    {
+        // error_log(print_r($client, true)) and var_dump() are common; neither
+        // (nor json_encode) must surface the key, which lives behind a closure.
+        $client = new Cotizave(['apiKey' => 'ctz_secret_dump']);
+
+        self::assertStringNotContainsString('ctz_secret_dump', print_r($client, true));
+
+        ob_start();
+        var_dump($client);
+        $dump = (string) ob_get_clean();
+        self::assertStringNotContainsString('ctz_secret_dump', $dump);
+
+        self::assertStringNotContainsString('ctz_secret_dump', (string) json_encode($client));
+    }
+
+    public function testOffOriginAndMalformedPathsRejectedAsTypedError(): void
+    {
+        // The origin check uses the SAME parser (GuzzleHttp\Psr7\Uri) that builds
+        // the request, so a path that resolves off-origin, or one the parser
+        // cannot resolve at all, becomes a typed invalid_request_path error —
+        // never an uncaught parser exception, never a request to another host.
+        $client = $this->client([]);
+        $paths = [
+            '@evil.com/steal',    // userinfo trick -> host becomes evil.com
+            'https://evil.com',   // embedded scheme -> host mismatch
+            '\\\\evil.com/x',     // backslash authority -> parser rejects (malformed)
+        ];
+        foreach ($paths as $path) {
+            try {
+                $client->request('GET', $path);
+                self::fail("expected rejection for path {$path}");
+            } catch (CotizaveException $e) {
+                self::assertSame('invalid_request_path', $e->errorCode, "path {$path}");
+            }
+        }
+        self::assertSame(0, $this->requestCount());
+    }
 }

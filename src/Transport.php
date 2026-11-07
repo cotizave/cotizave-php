@@ -10,6 +10,7 @@ use Cotizave\Exception\TimeoutException;
 use GuzzleHttp\Exception\ConnectException;
 use GuzzleHttp\Exception\TransferException;
 use GuzzleHttp\Psr7\Request;
+use GuzzleHttp\Psr7\Uri;
 use GuzzleHttp\RequestOptions;
 use Psr\Http\Message\ResponseInterface;
 
@@ -279,22 +280,33 @@ final class Transport
         if ($method === 'POST' && $hasBody) {
             $headers['Content-Type'] = 'application/json';
         }
-        $headers['X-API-Key'] = $this->config->apiKey;
+        $headers['X-API-Key'] = $this->config->apiKey();
 
         return $headers;
     }
 
+    /**
+     * The scheme/host/port origin of a URL, parsed with the SAME parser Guzzle
+     * uses to build the request (GuzzleHttp\Psr7\Uri). Using one parser for both
+     * the origin check and the actual request removes any parser-differential
+     * that could let a crafted path slip the API key to another host. A malformed
+     * URL returns a sentinel that never matches a real origin, so the caller gets
+     * a typed invalid_request_path error instead of an uncaught MalformedUriException.
+     */
     private static function originOf(string $url): string
     {
-        $p = parse_url($url);
-        if ($p === false || !isset($p['scheme'], $p['host'])) {
-            return '\0invalid'; // never matches a real origin
+        try {
+            $uri = new Uri($url);
+        } catch (\Throwable) {
+            return "\0invalid";
         }
-        $scheme = strtolower($p['scheme']);
-        $host = strtolower($p['host']);
-        $port = isset($p['port']) ? ':' . $p['port'] : '';
+        $host = strtolower($uri->getHost());
+        if ($host === '') {
+            return "\0invalid";
+        }
+        $port = $uri->getPort();
 
-        return "{$scheme}://{$host}{$port}";
+        return strtolower($uri->getScheme()) . '://' . $host . ($port !== null ? ':' . $port : '');
     }
 
     /**

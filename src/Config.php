@@ -55,7 +55,13 @@ final class Config
      * @param \Closure|null         $onResponse  invoked as fn(ResponseEvent): void
      */
     private function __construct(
-        public readonly string $apiKey,
+        /**
+         * Opaque handle into a private static secret store, NOT the key itself.
+         * The key is never an instance property, so it never appears in
+         * var_dump()/print_r()/var_export()/json_encode() of the client (static
+         * properties are not part of an object dump). Read it with apiKey().
+         */
+        private readonly string $secretRef,
         public readonly string $baseUrl,
         public readonly float $timeout,
         public readonly float $historyTimeout,
@@ -74,6 +80,32 @@ final class Config
         public readonly ?\Closure $onResponse,
         public readonly ClientInterface $httpClient,
     ) {
+    }
+
+    /**
+     * Process-wide secret store, keyed by the opaque per-config handle.
+     *
+     * @var array<string, string>
+     */
+    private static array $secretStore = [];
+
+    /** The resolved API key. Held off the instance so it never leaks into dumps. */
+    public function apiKey(): string
+    {
+        return self::$secretStore[$this->secretRef] ?? '';
+    }
+
+    public function __destruct()
+    {
+        unset(self::$secretStore[$this->secretRef]);
+    }
+
+    private static function storeSecret(string $apiKey): string
+    {
+        $ref = bin2hex(random_bytes(16));
+        self::$secretStore[$ref] = $apiKey;
+
+        return $ref;
     }
 
     /**
@@ -107,7 +139,7 @@ final class Config
         }
 
         return new self(
-            apiKey: $apiKey,
+            secretRef: self::storeSecret($apiKey),
             baseUrl: self::resolveBaseUrl($options),
             timeout: self::number($options['timeout'] ?? self::DEFAULT_TIMEOUT, 'timeout', 0.001),
             historyTimeout: self::number($options['historyTimeout'] ?? self::DEFAULT_HISTORY_TIMEOUT, 'historyTimeout', 0.001),
